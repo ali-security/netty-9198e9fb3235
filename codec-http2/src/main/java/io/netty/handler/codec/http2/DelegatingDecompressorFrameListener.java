@@ -105,11 +105,12 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
                 decompressor.incrementDecompressedBytes(compressedBytes);
                 return compressedBytes;
             }
+            ByteBuf nextBuf = null;
             try {
                 Http2LocalFlowController flowController = connection.local().flowController();
                 decompressor.incrementDecompressedBytes(padding);
                 for (;;) {
-                    ByteBuf nextBuf = nextReadableBuf(channel);
+                    nextBuf = nextReadableBuf(channel);
                     boolean decompressedEndOfStream = nextBuf == null && endOfStream;
                     if (decompressedEndOfStream && channel.finish()) {
                         nextBuf = nextReadableBuf(channel);
@@ -129,12 +130,18 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
                     padding = 0; // Padding is only communicated once on the first iteration.
                     buf.release();
                     buf = nextBuf;
+                    nextBuf = null;
                 }
                 // We consume bytes each time we call the listener to ensure if multiple frames are decompressed
                 // that the bytes are accounted for immediately. Otherwise the user may see an inconsistent state of
                 // flow control.
                 return 0;
             } finally {
+                // The look-ahead buffer must also be released if the listener or the flow controller throws,
+                // otherwise it would leak.
+                if (nextBuf != null) {
+                    nextBuf.release();
+                }
                 buf.release();
             }
         } catch (Http2Exception e) {
