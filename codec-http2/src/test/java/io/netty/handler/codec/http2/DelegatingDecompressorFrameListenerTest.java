@@ -14,33 +14,54 @@
  */
 package io.netty.handler.codec.http2;
 
+import io.netty.buffer.AbstractByteBufAllocator;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.compression.SnappyFrameEncoder;
 import io.netty.util.CharsetUtil;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
+
+import java.util.ArrayList;
+import java.util.List;
 
 import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_ENCODING;
 import static io.netty.handler.codec.http.HttpHeaderValues.SNAPPY;
 import static io.netty.handler.codec.http2.Http2Error.FLOW_CONTROL_ERROR;
 import static io.netty.handler.codec.http2.Http2Exception.streamError;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.anyInt;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 public class DelegatingDecompressorFrameListenerTest {
     private static final int STREAM_ID = 3;
+    // SnappyFrameEncoder compresses its input in slices of Short.MAX_VALUE bytes, each one becoming a separate
+    // chunk that SnappyFrameDecoder emits as its own decompressed buffer.
+    private static final int CHUNK_SIZE = Short.MAX_VALUE;
+    private static final int CHUNKS = 8;
 
+    private TrackingAllocator allocator;
     private EmbeddedChannel channel;
     private ChannelHandlerContext ctx;
     private Http2Connection connection;
@@ -50,7 +71,10 @@ public class DelegatingDecompressorFrameListenerTest {
 
     @BeforeEach
     public void setUp() throws Http2Exception {
+        allocator = new TrackingAllocator();
         channel = new EmbeddedChannel();
+        // The decompressor EmbeddedChannel shares the config (and so the allocator) of the parent channel.
+        channel.config().setAllocator(allocator);
         ctx = mock(ChannelHandlerContext.class);
         when(ctx.channel()).thenReturn(channel);
 
@@ -79,7 +103,8 @@ public class DelegatingDecompressorFrameListenerTest {
         ByteBuf data = snappyFramed("abc", "def");
         try {
             assertEquals(0, decompressorListener.onDataRead(ctx, STREAM_ID, data, 0, true));
-            verify(listener).onDataRead(eq(ctx), eq(STREAM_ID), any(ByteBuf.class), eq(0), eq(false));
+            // Every decompressed chunk is delivered on its own, the end of the stream is signalled afterwards.
+            verify(listener, times(2)).onDataRead(eq(ctx), eq(STREAM_ID), any(ByteBuf.class), eq(0), eq(false));
             verify(listener).onDataRead(eq(ctx), eq(STREAM_ID), any(ByteBuf.class), eq(0), eq(true));
             assertEquals(1, data.refCnt());
         } finally {
@@ -160,6 +185,119 @@ public class DelegatingDecompressorFrameListenerTest {
         }
     }
 
+    /**
+     * Regression test for CVE-2025-58057. A small, highly compressed DATA frame must not be fully inflated and
+     * buffered before it is handed to the listener: each decompressed chunk has to be delivered (and released)
+     * before the next one is produced.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = { 0, 10 })
+    public void decompressedDataIsStreamedToListenerInsteadOfBuffered(final int padding) throws Exception {
+        final List<Integer> liveBuffersAtDelivery = new ArrayList<Integer>();
+        final ByteBuf received = Unpooled.buffer();
+        final boolean[] endOfStreamSeen = new boolean[1];
+        when(listener.onDataRead(any(ChannelHandlerContext.class), anyInt(), any(ByteBuf.class), anyInt(),
+                anyBoolean())).thenAnswer(new Answer<Integer>() {
+            @Override
+            public Integer answer(InvocationOnMock invocation) {
+                ByteBuf data = (ByteBuf) invocation.getArguments()[2];
+                int processed = data.readableBytes() + (Integer) invocation.getArguments()[3];
+                if (data.isReadable()) {
+                    liveBuffersAtDelivery.add(allocator.liveBuffers());
+                    received.writeBytes(data);
+                }
+                if ((Boolean) invocation.getArguments()[4]) {
+                    endOfStreamSeen[0] = true;
+                }
+                return processed;
+            }
+        });
+        try {
+            ByteBuf compressed = snappyCompress(new byte[CHUNKS * CHUNK_SIZE]);
+            final int compressedBytes = compressed.readableBytes();
+            assertTrue(compressedBytes < CHUNK_SIZE, "payload must be highly compressed: " + compressedBytes);
+
+            int returned;
+            try {
+                returned = decompressorListener.onDataRead(ctx, STREAM_ID, compressed, padding, true);
+            } finally {
+                compressed.release();
+            }
+
+            assertEquals(CHUNKS, liveBuffersAtDelivery.size());
+            for (int live : liveBuffersAtDelivery) {
+                // Only the chunk currently handed to the listener may be alive. Before the fix every chunk of the
+                // frame was decompressed into the EmbeddedChannel's inbound queue before the first one was delivered.
+                assertEquals(1, live, "decompressed buffers alive at delivery: " + liveBuffersAtDelivery);
+            }
+            assertEquals(0, allocator.liveBuffers());
+            assertEquals(CHUNKS * CHUNK_SIZE, received.readableBytes());
+            assertTrue(endOfStreamSeen[0]);
+
+            // All compressed bytes (including padding) must be returned to the flow controller exactly once.
+            ArgumentCaptor<Integer> consumed = ArgumentCaptor.forClass(Integer.class);
+            verify(flowController, atLeastOnce()).consumeBytes(eq(connection.stream(STREAM_ID)), consumed.capture());
+            int totalConsumed = returned;
+            for (int bytes : consumed.getAllValues()) {
+                totalConsumed += bytes;
+            }
+            assertEquals(compressedBytes + padding, totalConsumed);
+        } finally {
+            received.release();
+        }
+    }
+
+    @Test
+    public void decompressedBufferIsReleasedWhenListenerThrows() throws Exception {
+        final Http2Exception failure = streamError(STREAM_ID, Http2Error.INTERNAL_ERROR, "boom");
+        when(listener.onDataRead(any(ChannelHandlerContext.class), anyInt(), any(ByteBuf.class), anyInt(),
+                anyBoolean())).thenAnswer(new Answer<Integer>() {
+            @Override
+            public Integer answer(InvocationOnMock invocation) throws Throwable {
+                ByteBuf data = (ByteBuf) invocation.getArguments()[2];
+                if (data.isReadable()) {
+                    throw failure;
+                }
+                return (Integer) invocation.getArguments()[3];
+            }
+        });
+
+        final ByteBuf compressed = snappyCompress(new byte[CHUNKS * CHUNK_SIZE]);
+        try {
+            Http2Exception thrown = assertThrows(Http2Exception.class, new Executable() {
+                @Override
+                public void execute() throws Throwable {
+                    decompressorListener.onDataRead(ctx, STREAM_ID, compressed, 0, false);
+                }
+            });
+            assertSame(failure, thrown);
+        } finally {
+            compressed.release();
+        }
+        assertFalse(allocator.allocated.isEmpty());
+        // Neither the chunk handed to the failing listener nor any chunk decompressed afterwards may be retained.
+        assertEquals(0, allocator.liveBuffers());
+    }
+
+    private static ByteBuf snappyCompress(byte[] data) {
+        EmbeddedChannel encoder = new EmbeddedChannel(new SnappyFrameEncoder());
+        try {
+            assertTrue(encoder.writeOutbound(Unpooled.wrappedBuffer(data)));
+            ByteBuf compressed = Unpooled.buffer();
+            for (;;) {
+                ByteBuf buf = encoder.readOutbound();
+                if (buf == null) {
+                    break;
+                }
+                compressed.writeBytes(buf);
+                buf.release();
+            }
+            return compressed;
+        } finally {
+            encoder.finishAndReleaseAll();
+        }
+    }
+
     private static ByteBuf snappyFramed(String... chunks) {
         ByteBuf framed = Unpooled.buffer();
         // Stream identifier chunk.
@@ -170,5 +308,42 @@ public class DelegatingDecompressorFrameListenerTest {
             framed.writeByte(0x01).writeMediumLE(4 + bytes.length).writeIntLE(0).writeBytes(bytes);
         }
         return framed;
+    }
+
+    private static final class TrackingAllocator extends AbstractByteBufAllocator {
+        final List<ByteBuf> allocated = new ArrayList<ByteBuf>();
+
+        TrackingAllocator() {
+            super(false);
+        }
+
+        @Override
+        protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
+            ByteBuf buf = UnpooledByteBufAllocator.DEFAULT.heapBuffer(initialCapacity, maxCapacity);
+            allocated.add(buf);
+            return buf;
+        }
+
+        @Override
+        protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {
+            ByteBuf buf = UnpooledByteBufAllocator.DEFAULT.directBuffer(initialCapacity, maxCapacity);
+            allocated.add(buf);
+            return buf;
+        }
+
+        @Override
+        public boolean isDirectBufferPooled() {
+            return false;
+        }
+
+        int liveBuffers() {
+            int live = 0;
+            for (ByteBuf buf : allocated) {
+                if (buf.refCnt() > 0) {
+                    live++;
+                }
+            }
+            return live;
+        }
     }
 }
